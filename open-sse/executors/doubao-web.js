@@ -1,19 +1,18 @@
 import { randomUUID } from "node:crypto";
 import { BaseExecutor } from "./base.js";
-import { proxyAwareFetch } from "../utils/proxyFetch.js";
-// ⚠️ perlu dicek: apakah utils/error.js sudah punya fungsi ini
-import { makeExecutorErrorResult as makeErrorResult, normalizeCookie } from "../utils/error.js";
+import { PROVIDERS } from "../config/providers.js";
+import { errorResponse } from "../utils/error.js";
+import { sseChunk } from "../utils/sse.js";
+import { SSE_DONE, SSE_HEADERS_NO_BUFFER } from "../utils/sseConstants.js";
 
-const BASE_URL = "https://www.dola.com";
-const CHAT_URL = `${BASE_URL}/chat/completion`;
+const CHAT_URL = PROVIDERS["doubao-web"].baseUrl; // https://www.dola.com/chat/completion
 const DEFAULT_MODEL = "dola-speed";
 const DOLA_BOT_ID = "7339470689562525703";
 const USER_AGENT =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36";
 
-function asRecord(value) {
-  return value && typeof value === "object" && !Array.isArray(value) ? value : {};
-}
+// --- helpers (sama seperti sebelumnya, tidak berubah) ---
+function asRecord(value) { return value && typeof value === "object" && !Array.isArray(value) ? value : {}; }
 function toString(value) { return typeof value === "string" ? value.trim() : ""; }
 function toContentText(value) { return typeof value === "string" ? value : ""; }
 function parseJsonRecord(raw) {
@@ -51,6 +50,12 @@ function createDolaTextExtractionState(modelId) {
 }
 function isDolaAnswerBoundary(block) { return block.block_type === 10040 && block.is_finish === true; }
 
+// ⚠️ Tidak ada normalizeCookie di 9router — dibuat versi lokal minimal
+function normalizeCookie(raw) {
+  if (!raw) return "";
+  return raw.replace(/^Cookie:\s*/i, "").trim();
+}
+
 export function foldMessages(messages) {
   if (!Array.isArray(messages)) return "";
   return messages.map((message) => {
@@ -85,7 +90,7 @@ export function resolveDolaFingerprint(cookieHeader, providerSpecificData, rawCr
 
 export function buildDolaCookieHeader(rawCredential, providerSpecificData) {
   const providerData = asRecord(providerSpecificData);
-  const raw = normalizeCookie(rawCredential.trim());
+  const raw = normalizeCookie((rawCredential || "").trim());
   const parsed = parseJsonRecord(raw);
   const data = { ...providerData, ...(parsed ?? {}) };
   const explicitCookie = normalizeCookie(toString(data.cookie));
@@ -198,20 +203,14 @@ export function isDolaBusyMessage(content) {
   const normalized = content.trim().toLowerCase();
   return normalized.includes("a lot of people are using the app right now") && normalized.includes("try again later");
 }
-function openAiChunk(modelId, content) {
-  return { id: `chatcmpl-dola-${Date.now()}`, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model: modelId, choices: [{ index: 0, delta: { content }, finish_reason: null }] };
-}
-function openAiCompletion(modelId, content) {
-  return { id: `chatcmpl-dola-${Date.now()}`, object: "chat.completion", created: Math.floor(Date.now() / 1000), model: modelId, choices: [{ index: 0, message: { role: "assistant", content }, finish_reason: "stop" }] };
-}
 
 export class DoubaoWebExecutor extends BaseExecutor {
   constructor() {
-    super("doubao-web", { id: "doubao-web", baseUrl: BASE_URL });
+    super("doubao-web", PROVIDERS["doubao-web"]);
   }
 
   createHeaders(cookieHeader) {
-    const headers = { "Content-Type": "application/json", "User-Agent": USER_AGENT, Accept: "text/event-stream", Referer: `${BASE_URL}/chat/`, Origin: BASE_URL, "Agw-Js-Conv": "str" };
+    const headers = { "Content-Type": "application/json", "User-Agent": USER_AGENT, Accept: "text/event-stream", Referer: "https://www.dola.com/chat/", Origin: "https://www.dola.com", "Agw-Js-Conv": "str" };
     if (cookieHeader) headers.Cookie = cookieHeader;
     return headers;
   }
@@ -228,15 +227,22 @@ export class DoubaoWebExecutor extends BaseExecutor {
     return deltas.join("");
   }
 
-  createStream(upstream, modelId, signal) {
+  // Pakai sseChunk/SSE_DONE dari util 9router sendiri, samakan format dgn grok-web.js
+  createStream(upstream, modelId, cid, created, signal) {
     const encoder = new TextEncoder();
     const decoder = new TextDecoder();
     const state = createDolaTextExtractionState(modelId);
     let sentDone = false;
+
     return new ReadableStream({
       async start(controller) {
+        controller.enqueue(encoder.encode(sseChunk({
+          id: cid, object: "chat.completion.chunk", created, model: modelId,
+          choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }],
+        })));
+
         const reader = upstream.body?.getReader();
-        if (!reader) { controller.enqueue(encoder.encode("data: [DONE]\n\n")); controller.close(); return; }
+        if (!reader) { controller.enqueue(encoder.encode(SSE_DONE)); controller.close(); return; }
         let buffer = ""; let errored = false;
         try {
           while (true) {
@@ -254,9 +260,12 @@ export class DoubaoWebExecutor extends BaseExecutor {
                 return;
               }
               for (const text of extractDolaTextDeltas(event.data, state)) {
-                controller.enqueue(encoder.encode(`data: ${JSON.stringify(openAiChunk(modelId, text))}\n\n`));
+                controller.enqueue(encoder.encode(sseChunk({
+                  id: cid, object: "chat.completion.chunk", created, model: modelId,
+                  choices: [{ index: 0, delta: { content: text }, finish_reason: null }],
+                })));
               }
-              if (event.event === "SSE_REPLY_END") { sentDone = true; controller.enqueue(encoder.encode("data: [DONE]\n\n")); }
+              if (event.event === "SSE_REPLY_END") sentDone = true;
             }
           }
         } catch (err) {
@@ -265,18 +274,24 @@ export class DoubaoWebExecutor extends BaseExecutor {
         } finally {
           if (errored) return;
           for (const text of flushDolaTextExtractionState(state)) {
-            controller.enqueue(encoder.encode(`data: ${JSON.stringify(openAiChunk(modelId, text))}\n\n`));
+            controller.enqueue(encoder.encode(sseChunk({
+              id: cid, object: "chat.completion.chunk", created, model: modelId,
+              choices: [{ index: 0, delta: { content: text }, finish_reason: null }],
+            })));
           }
-          if (!sentDone) controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+          controller.enqueue(encoder.encode(sseChunk({
+            id: cid, object: "chat.completion.chunk", created, model: modelId,
+            choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+          })));
+          controller.enqueue(encoder.encode(SSE_DONE));
           controller.close();
         }
       },
     });
   }
 
-  // ⚠️ Override total, TIDAK memakai retry-loop generik base.execute() —
-  // sama seperti kemungkinan besar grok-web.js / perplexity-web.js kamu.
-  async execute({ model, body, stream, credentials, signal, log, proxyOptions = null }) {
+  // ⚠️ Override total execute(), sama seperti GrokWebExecutor — tidak pakai retry-loop generik base.js
+  async execute({ model, body, stream, credentials, signal, log }) {
     const bodyObj = asRecord(body);
     const providerSpecificData = credentials?.providerSpecificData;
     const rawCredential = toString(credentials?.apiKey);
@@ -291,41 +306,53 @@ export class DoubaoWebExecutor extends BaseExecutor {
     const headers = this.createHeaders(cookieHeader);
 
     if (!extractCookieValue(cookieHeader, "sessionid")) {
-      return { ...makeErrorResult(401, "Dola Web requires a www.dola.com Cookie header containing at least sessionid, ttwid, and s_v_web_id.", body, url), headers, transformedBody };
+      const resp = errorResponse(401, "Dola Web requires a www.dola.com Cookie header containing at least sessionid, ttwid, and s_v_web_id.");
+      return { response: resp, url, headers, transformedBody };
     }
     if (!fingerprint) {
-      return { ...makeErrorResult(401, "Dola Web requires the browser fingerprint value from www.dola.com.", body, url), headers, transformedBody };
+      const resp = errorResponse(401, "Dola Web requires the browser fingerprint value from www.dola.com (s_v_web_id or fp).");
+      return { response: resp, url, headers, transformedBody };
     }
 
     let upstream;
     try {
-      upstream = await proxyAwareFetch(url, { method: "POST", headers, body: JSON.stringify(transformedBody), signal }, proxyOptions);
+      upstream = await fetch(url, { method: "POST", headers, body: JSON.stringify(transformedBody), signal });
     } catch (err) {
-      return { ...makeErrorResult(502, `Dola fetch failed: ${err instanceof Error ? err.message : "unknown"}`, body, url), headers, transformedBody };
+      log?.error?.("DOUBAO-WEB", `Fetch failed: ${err.message || String(err)}`);
+      const resp = errorResponse(502, `Dola fetch failed: ${err instanceof Error ? err.message : "unknown"}`);
+      return { response: resp, url, headers, transformedBody };
     }
 
     if (!upstream.ok) {
       const errText = await upstream.text().catch(() => "");
-      return { ...makeErrorResult(upstream.status, `Dola error: ${errText}`, body, url), headers, transformedBody };
+      return { response: errorResponse(upstream.status, `Dola error: ${errText}`), url, headers, transformedBody };
     }
 
     const contentType = upstream.headers.get("Content-Type") || "";
     if (!contentType.toLowerCase().includes("text/event-stream")) {
       const text = await upstream.text().catch(() => "");
-      return { ...makeErrorResult(502, `Dola returned non-SSE response: ${text}`, body, url), headers, transformedBody };
+      return { response: errorResponse(502, `Dola returned non-SSE response: ${text}`), url, headers, transformedBody };
     }
+
+    const cid = `chatcmpl-dola-${randomUUID().slice(0, 12)}`;
+    const created = Math.floor(Date.now() / 1000);
 
     if (!stream) {
       const content = await this.collectText(upstream, modelId);
       if (isDolaBusyMessage(content)) {
-        return { ...makeErrorResult(429, "Dola is temporarily busy. Please try again later.", body, url), headers, transformedBody };
+        return { response: errorResponse(429, "Dola is temporarily busy. Please try again later."), url, headers, transformedBody };
       }
-      return { response: new Response(JSON.stringify(openAiCompletion(modelId, content)), { headers: { "Content-Type": "application/json" } }), url, headers, transformedBody };
+      const resp = new Response(JSON.stringify({
+        id: cid, object: "chat.completion", created, model: modelId,
+        choices: [{ index: 0, message: { role: "assistant", content }, finish_reason: "stop" }],
+      }), { status: 200, headers: { "Content-Type": "application/json" } });
+      return { response: resp, url, headers, transformedBody };
     }
 
-    return {
-      response: new Response(this.createStream(upstream, modelId, signal), { headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", Connection: "keep-alive" } }),
-      url, headers, transformedBody,
-    };
+    const sseStream = this.createStream(upstream, modelId, cid, created, signal);
+    const resp = new Response(sseStream, { status: 200, headers: { ...SSE_HEADERS_NO_BUFFER } });
+    return { response: resp, url, headers, transformedBody };
   }
 }
+
+export default DoubaoWebExecutor;
