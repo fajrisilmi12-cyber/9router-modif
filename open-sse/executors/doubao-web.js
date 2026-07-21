@@ -140,4 +140,192 @@ export function buildDolaPayload(prompt, modelId = DEFAULT_MODEL, cookieHeader =
 
   return {
     client_meta: { local_conversation_id: localConversationId, conversation_id: "", bot_id: toString(data.bot_id) || DOLA_BOT_ID, last_section_id: "", last_message_index: null },
-    messages:
+    messages: [{ local_message_id: messageId, content_block: [{ block_type: 10000, content: { text_block: { text: prompt, icon_url: "", icon_url_dark: "", summary: "" }, pc_event_block: "" }, block_id: blockId, parent_id: "", meta_info: [], append_fields: [] }], message_status: 0 }],
+    option: { send_message_scene: "", create_time_ms: now, collect_id: "", is_audio: false, answer_with_suggest: false, tts_switch: false, need_deep_think: deepThinkValue, click_clear_context: false, from_suggest: false, is_regen: false, is_replace: false, is_from_click_option: false, is_from_click_softlink: false, disable_sse_cache: false, select_text_action: "", is_select_text: false, resend_for_regen: false, scene_type: 0, unique_key: uniqueKey, start_seq: 0, need_create_conversation: true, conversation_init_option: { need_ack_conversation: true }, regen_query_id: [], edit_query_id: [], regen_instruction: "", no_replace_for_regen: false, message_from: 0, shared_app_name: "", shared_app_id: "", sse_recv_event_options: { support_chunk_delta: true }, is_ai_playground: false, is_old_user: false, recovery_option: { is_recovery: false, req_create_time_sec: Math.floor(now / 1000), append_sse_event_scene: 0 }, message_storage_type: 0 },
+    user_context: [],
+    ext: { use_deep_think: String(deepThinkValue), fp, sub_conv_firstmet_type: "1", collection_id: "", conversation_init_option: JSON.stringify({ need_ack_conversation: true }), commerce_credit_config_enable: "0" },
+  };
+}
+
+function parseSseBlock(block) {
+  const lines = block.split(/\r?\n/);
+  const event = lines.find((l) => l.startsWith("event:"))?.slice(6).trim();
+  const dataLines = lines.filter((l) => l.startsWith("data:")).map((l) => l.slice(5).trim());
+  if (dataLines.length === 0) return null;
+  const rawData = dataLines.join("\n");
+  if (rawData === "[DONE]") return { event: event || "done", data: "[DONE]" };
+  try { return { event: event || "", data: JSON.parse(rawData) }; } catch { return null; }
+}
+
+function extractDolaBlockDeltas(blocks, state) {
+  const deltas = [];
+  for (const block of blocks) {
+    const blockRecord = asRecord(block);
+    if (state && isDolaAnswerBoundary(blockRecord)) { state.answerStarted = true; state.bufferedDeltas = []; continue; }
+    const text = toContentText(asRecord(asRecord(blockRecord.content).text_block).text);
+    if (!text) continue;
+    if (!state || state.answerStarted) deltas.push(text); else state.bufferedDeltas.push(text);
+  }
+  return deltas;
+}
+function flushDolaTextExtractionState(state) {
+  if (state.answerStarted) return [];
+  const fallback = state.bufferedDeltas;
+  state.bufferedDeltas = []; state.answerStarted = true;
+  return fallback;
+}
+export function extractDolaTextDeltas(data, state) {
+  const root = asRecord(data);
+  const payload = asRecord(root.data);
+  const content = asRecord(root.content);
+  const payloadContent = asRecord(payload.content);
+  const initialBlocks = Array.isArray(content.content_block) ? content.content_block : Array.isArray(payloadContent.content_block) ? payloadContent.content_block : [];
+  const patchOps = Array.isArray(root.patch_op) ? root.patch_op : Array.isArray(payload.patch_op) ? payload.patch_op : [];
+  const deltas = extractDolaBlockDeltas(initialBlocks, state);
+  for (const op of patchOps) {
+    const patchValue = asRecord(asRecord(op).patch_value);
+    const blocks = Array.isArray(patchValue.content_block) ? patchValue.content_block : [];
+    deltas.push(...extractDolaBlockDeltas(blocks, state));
+  }
+  return deltas;
+}
+function extractDolaError(data) {
+  const root = asRecord(data);
+  const payload = asRecord(root.data);
+  return toString(root.message) || toString(payload.message) || toString(payload.error_msg) || toString(payload.errorMessage);
+}
+export function isDolaBusyMessage(content) {
+  const normalized = content.trim().toLowerCase();
+  return normalized.includes("a lot of people are using the app right now") && normalized.includes("try again later");
+}
+function openAiChunk(modelId, content) {
+  return { id: `chatcmpl-dola-${Date.now()}`, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model: modelId, choices: [{ index: 0, delta: { content }, finish_reason: null }] };
+}
+function openAiCompletion(modelId, content) {
+  return { id: `chatcmpl-dola-${Date.now()}`, object: "chat.completion", created: Math.floor(Date.now() / 1000), model: modelId, choices: [{ index: 0, message: { role: "assistant", content }, finish_reason: "stop" }] };
+}
+
+export class DoubaoWebExecutor extends BaseExecutor {
+  constructor() {
+    super("doubao-web", { id: "doubao-web", baseUrl: BASE_URL });
+  }
+
+  createHeaders(cookieHeader) {
+    const headers = { "Content-Type": "application/json", "User-Agent": USER_AGENT, Accept: "text/event-stream", Referer: `${BASE_URL}/chat/`, Origin: BASE_URL, "Agw-Js-Conv": "str" };
+    if (cookieHeader) headers.Cookie = cookieHeader;
+    return headers;
+  }
+
+  async collectText(upstream, modelId) {
+    const raw = await upstream.text();
+    const state = createDolaTextExtractionState(modelId);
+    const deltas = [];
+    for (const block of raw.split(/\r?\n\r?\n/)) {
+      const event = parseSseBlock(block);
+      if (event) deltas.push(...extractDolaTextDeltas(event.data, state));
+    }
+    deltas.push(...flushDolaTextExtractionState(state));
+    return deltas.join("");
+  }
+
+  createStream(upstream, modelId, signal) {
+    const encoder = new TextEncoder();
+    const decoder = new TextDecoder();
+    const state = createDolaTextExtractionState(modelId);
+    let sentDone = false;
+    return new ReadableStream({
+      async start(controller) {
+        const reader = upstream.body?.getReader();
+        if (!reader) { controller.enqueue(encoder.encode("data: [DONE]\n\n")); controller.close(); return; }
+        let buffer = ""; let errored = false;
+        try {
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            buffer += decoder.decode(value, { stream: true });
+            const blocks = buffer.split(/\r?\n\r?\n/);
+            buffer = blocks.pop() || "";
+            for (const block of blocks) {
+              const event = parseSseBlock(block);
+              if (!event) continue;
+              if (event.event === "STREAM_ERROR") {
+                errored = true;
+                controller.error(new Error(extractDolaError(event.data) || "Dola stream error"));
+                return;
+              }
+              for (const text of extractDolaTextDeltas(event.data, state)) {
+                controller.enqueue(encoder.encode(`data: ${JSON.stringify(openAiChunk(modelId, text))}\n\n`));
+              }
+              if (event.event === "SSE_REPLY_END") { sentDone = true; controller.enqueue(encoder.encode("data: [DONE]\n\n")); }
+            }
+          }
+        } catch (err) {
+          if (!signal?.aborted) { errored = true; controller.error(err); }
+          return;
+        } finally {
+          if (errored) return;
+          for (const text of flushDolaTextExtractionState(state)) {
+            controller.enqueue(encoder.encode(`data: ${JSON.stringify(openAiChunk(modelId, text))}\n\n`));
+          }
+          if (!sentDone) controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+          controller.close();
+        }
+      },
+    });
+  }
+
+  // ⚠️ Override total, TIDAK memakai retry-loop generik base.execute() —
+  // sama seperti kemungkinan besar grok-web.js / perplexity-web.js kamu.
+  async execute({ model, body, stream, credentials, signal, log, proxyOptions = null }) {
+    const bodyObj = asRecord(body);
+    const providerSpecificData = credentials?.providerSpecificData;
+    const rawCredential = toString(credentials?.apiKey);
+    const cookieHeader = buildDolaCookieHeader(rawCredential, providerSpecificData);
+    const requestedModel = toString(bodyObj.model) || model || DEFAULT_MODEL;
+    const modelId = requestedModel.split("/").pop() || DEFAULT_MODEL;
+    const prompt = foldMessages(bodyObj.messages);
+    const fingerprint = resolveDolaFingerprint(cookieHeader, providerSpecificData, rawCredential);
+    const transformedBody = buildDolaPayload(prompt, modelId, cookieHeader, providerSpecificData, rawCredential);
+    const query = buildDolaQueryParams(cookieHeader, providerSpecificData, rawCredential);
+    const url = `${CHAT_URL}?${query.toString()}`;
+    const headers = this.createHeaders(cookieHeader);
+
+    if (!extractCookieValue(cookieHeader, "sessionid")) {
+      return { ...makeErrorResult(401, "Dola Web requires a www.dola.com Cookie header containing at least sessionid, ttwid, and s_v_web_id.", body, url), headers, transformedBody };
+    }
+    if (!fingerprint) {
+      return { ...makeErrorResult(401, "Dola Web requires the browser fingerprint value from www.dola.com.", body, url), headers, transformedBody };
+    }
+
+    let upstream;
+    try {
+      upstream = await proxyAwareFetch(url, { method: "POST", headers, body: JSON.stringify(transformedBody), signal }, proxyOptions);
+    } catch (err) {
+      return { ...makeErrorResult(502, `Dola fetch failed: ${err instanceof Error ? err.message : "unknown"}`, body, url), headers, transformedBody };
+    }
+
+    if (!upstream.ok) {
+      const errText = await upstream.text().catch(() => "");
+      return { ...makeErrorResult(upstream.status, `Dola error: ${errText}`, body, url), headers, transformedBody };
+    }
+
+    const contentType = upstream.headers.get("Content-Type") || "";
+    if (!contentType.toLowerCase().includes("text/event-stream")) {
+      const text = await upstream.text().catch(() => "");
+      return { ...makeErrorResult(502, `Dola returned non-SSE response: ${text}`, body, url), headers, transformedBody };
+    }
+
+    if (!stream) {
+      const content = await this.collectText(upstream, modelId);
+      if (isDolaBusyMessage(content)) {
+        return { ...makeErrorResult(429, "Dola is temporarily busy. Please try again later.", body, url), headers, transformedBody };
+      }
+      return { response: new Response(JSON.stringify(openAiCompletion(modelId, content)), { headers: { "Content-Type": "application/json" } }), url, headers, transformedBody };
+    }
+
+    return {
+      response: new Response(this.createStream(upstream, modelId, signal), { headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", Connection: "keep-alive" } }),
+      url, headers, transformedBody,
+    };
+  }
+}
