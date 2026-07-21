@@ -8,7 +8,11 @@ export function resolveOllamaLocalHost(credentials) {
   const raw = credentials?.providerSpecificData?.baseUrl?.trim();
   return (raw || OLLAMA_LOCAL_DEFAULT_HOST).replace(/\/$/, "");
 }
-
+"doubao-web": {
+  id: "doubao-web",
+  baseUrl: "https://www.dola.com/chat/completion",
+  // models: ["dola-speed", "dola-pro", "dola-deep-think"]  // sesuaikan dgn format entry provider lain di file ini
+},
 // Region URLs single-source from registry xiaomi-tokenplan.transport
 export const XIAOMI_TOKENPLAN_REGIONS = PROVIDERS["xiaomi-tokenplan"]?.regions || {};
 export const XIAOMI_TOKENPLAN_DEFAULT_REGION = PROVIDERS["xiaomi-tokenplan"]?.defaultRegion;
